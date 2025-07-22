@@ -2,44 +2,90 @@ name: CI Build and Test
 
 on:
   pull_request:
-    branches: [ develop ]
+    branches: [ develop ]  # CI: PR 생성/수정 시
+    paths:
+      - 'backend/**'
+
+  push:
+    branches: [ develop ]  # CD: PR 머지 후 develop에 push 시
     paths:
       - 'backend/**'
 
 jobs:
   build_and_test:
-     runs-on: ubuntu-latest
-     
-     defaults:
+    runs-on: ubuntu-latest
+
+    defaults:
       run:
         working-directory: backend
-        
-     steps: 
-     - name: Checkout code
-       uses: actions/checkout@v4
 
-     - name: Set up Gradle
-       uses: gradle/actions/setup-gradle@v3
-             
-     - name: Grant execute permission for gradlew
-       run: chmod +x gradlew
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-     - name: Set up JDK 21
-       uses: actions/setup-java@v4
-       with:
-         java-version: '21'
-         distribution: 'temurin'
-         cache: 'gradle'
-       
-     - name: Build with Gradle
-       run: ./gradlew clean build -x test
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
 
-     - name: Run Unit Tests
-       run: ./gradlew test
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
 
-     - name: Upload Jar
-       uses: actions/upload-artifact@v4
-       with:
-         name: spring-boot-app
-         path: build/libs/*.jar
-         retention-days: 5
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Build with Gradle
+        run: ./gradlew clean build -x test
+
+      - name: Run Unit Tests
+        run: ./gradlew test
+
+      - name: Upload Jar (only on push)
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-app
+          path: backend/build/libs/*.jar
+          retention-days: 5
+
+  deploy:
+    if: github.event_name == 'push'  # CD는 push 때만 실행
+    needs: build_and_test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spring-boot-app
+          path: build/libs/
+
+      - name: Create .ssh directory and add EC2 host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create private key file
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Upload JAR to EC2
+        run: |
+          scp -i private_key.pem build/libs/*.jar ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USERNAME }}/Project.jar
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            pgrep java && pgrep java | xargs -r kill -9
+            export $(grep -v '^#' /home/${{ secrets.EC2_USERNAME }}/project/.env | xargs)
+            nohup java -jar /home/${{ secrets.EC2_USERNAME }}/Project.jar > /home/${{ secrets.EC2_USERNAME }}/log/app_log.out 2>&1 &
+
+      - name: Remove private key file
+        run: rm -f private_key.pem
